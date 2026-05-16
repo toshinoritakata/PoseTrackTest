@@ -57,6 +57,17 @@ class Config:
     smooth_min_cutoff: float = 1.0
     smooth_beta: float = 0.01       # 大きくするほど速い動きへの追従が向上
 
+    # --- Face ID ---
+    face_enabled: bool = False
+    # facenet-pytorch デバイス（MPS は現時点で不安定なため cpu 推奨）
+    face_device: str = "cpu"
+    # コサイン類似度の閾値（0〜1、高いほど厳格）
+    face_similarity_thresh: float = 0.6
+    # ターゲット登録用の写真パス。None の場合は起動後にクリックで登録
+    face_target_photo: str | None = None
+    # 顔認識をNフレームに1回実行（ターゲット確定後の定期確認）
+    face_stride: int = 15
+
     # --- I/O ---
     source: int | str = 0
     show: bool = True
@@ -123,6 +134,14 @@ class Pipeline:
         self._track_hits: dict[int, int] = {}          # track_id → 連続マッチ回数
         self._emb_cache: dict[int, np.ndarray] = {}   # track_id → 最後の embedding
         self._bbox_cache: dict[int, np.ndarray] = {}  # track_id → 最後の bbox
+        # 顔認識ステート
+        self._face = self._build_face()                # FaceIdentifier or None
+        self._target_id: int | None = None             # 現在のターゲット track_id
+        self._registering: bool = (                    # クリック登録待ち状態
+            cfg.face_enabled and cfg.face_target_photo is None
+        )
+        self._pending_frame: np.ndarray | None = None  # マウスコールバック用
+        self._pending_results: list[dict] | None = None
 
     # ------------------------------------------------------------------
     # Component construction
@@ -141,6 +160,22 @@ class Pipeline:
             self._reid = ReID(path=WEIGHTS / self.cfg.reid_model, device=self.cfg.reid_device)
             reid_model = self._reid.model
         return BotSort(reid_model=reid_model, with_reid=self.cfg.tracker_with_reid)
+
+    def _build_face(self):
+        if not self.cfg.face_enabled:
+            return None
+        from face_identifier import FaceIdentifier
+        fi = FaceIdentifier(
+            similarity_thresh=self.cfg.face_similarity_thresh,
+            device=self.cfg.face_device,
+        )
+        if self.cfg.face_target_photo:
+            if not fi.register_from_photo(self.cfg.face_target_photo):
+                raise RuntimeError(
+                    f"No face detected in photo: {self.cfg.face_target_photo}"
+                )
+            print(f"[FaceID] Target registered from photo: {self.cfg.face_target_photo}")
+        return fi
 
     def _build_pose(self):
         from rtmlib import RTMPose
@@ -355,14 +390,70 @@ class Pipeline:
         smoothed = self._smooth(track_ids, keypoints, scores)
         self._smoother.cleanup(active_ids)
 
-        return [
-            {"track_id": tid, "bbox": bboxes[i], "keypoints": smoothed[i]}
+        # ターゲットトラックが消えた場合はリセット
+        if self._target_id is not None and self._target_id not in active_ids:
+            self._target_id = None
+
+        results = [
+            {
+                "track_id":  tid,
+                "bbox":      bboxes[i],
+                "keypoints": smoothed[i],
+                "is_target": tid == self._target_id,
+            }
             for i, tid in enumerate(track_ids)
         ]
+
+        # 顔認識によるターゲット同定
+        if self._face is not None and self._face.registered and not self._registering:
+            run_face = (
+                self._target_id is None                                   # まだ未発見
+                or self._frame_idx % self.cfg.face_stride == 0            # 定期確認
+            )
+            if run_face:
+                found = self._face.find_target(
+                    frame, results, preferred_id=self._target_id
+                )
+                if found is not None and found != self._target_id:
+                    self._target_id = found
+                    for r in results:
+                        r["is_target"] = r["track_id"] == self._target_id
+
+        return results
 
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
+
+    def _on_mouse(self, event: int, x: int, y: int, flags: int, param) -> None:
+        """クリックされた bbox の人物顔をターゲットとして登録する。"""
+        if event != cv2.EVENT_LBUTTONDOWN or not self._registering:
+            return
+        if self._pending_frame is None or self._pending_results is None:
+            return
+        for t in self._pending_results:
+            x1, y1, x2, y2 = (int(v) for v in t["bbox"])
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                crop = self._pending_frame[y1:y2, x1:x2]
+                if self._face.register_from_crop(crop):
+                    self._registering = False
+                    self._target_id = t["track_id"]
+                    print(f"[FaceID] Target registered (ID {self._target_id})")
+                else:
+                    print("[FaceID] No face detected — try clicking again")
+                break
+
+    def _draw_face_overlay(self, vis: np.ndarray) -> np.ndarray:
+        """顔認識の状態をフレームに重ねて表示する。"""
+        if self._registering:
+            msg, color = "Click on target person", (0, 255, 255)
+        elif self._target_id is not None:
+            msg, color = f"Target: ID {self._target_id}", (0, 255, 0)
+        else:
+            msg, color = "Searching for target...", (0, 165, 255)
+        cv2.putText(vis, msg, (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        return vis
 
     def run(self) -> None:
         cap = cv2.VideoCapture(_resolve_source(self.cfg.source))
@@ -376,6 +467,12 @@ class Pipeline:
             fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             writer = cv2.VideoWriter(self.cfg.output_path, fourcc, fps, (w, h))
+
+        win = "Multi-person Tracking"
+        if self.cfg.show:
+            cv2.namedWindow(win)
+            if self._face is not None:
+                cv2.setMouseCallback(win, self._on_mouse)
 
         t_prev = time.perf_counter()
         try:
@@ -392,9 +489,15 @@ class Pipeline:
 
                 vis = draw_results(frame, results)
                 vis = draw_fps(vis, fps_live)
+                if self._face is not None:
+                    vis = self._draw_face_overlay(vis)
+
+                # マウスコールバック用に最新フレームを保持
+                self._pending_frame = frame
+                self._pending_results = results
 
                 if self.cfg.show:
-                    cv2.imshow("Multi-person Tracking", vis)
+                    cv2.imshow(win, vis)
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
 

@@ -15,6 +15,15 @@ def parse_args() -> Config:
     p.add_argument("--output", default=None, help="Path to save output video")
     p.add_argument("--smooth-beta", type=float, default=0.01,
                    help="One-Euro beta: larger = more responsive on fast motion")
+
+    # Face ID
+    p.add_argument("--face", action="store_true",
+                   help="Enable face-based target tracking")
+    p.add_argument("--target-photo", default=None,
+                   help="Path to target person's photo for face registration")
+    p.add_argument("--face-thresh", type=float, default=0.6,
+                   help="Cosine similarity threshold for face matching (default: 0.6)")
+
     args = p.parse_args()
 
     return Config(
@@ -24,6 +33,9 @@ def parse_args() -> Config:
         show=not args.no_show,
         output_path=args.output,
         smooth_beta=args.smooth_beta,
+        face_enabled=args.face,
+        face_target_photo=args.target_photo,
+        face_similarity_thresh=args.face_thresh,
     )
 
 

@@ -40,13 +40,16 @@ def draw_results(
 
     for t in tracks:
         tid = t["track_id"]
-        color = _track_color(tid)
+        is_target = t.get("is_target", False)
+        color = (0, 255, 0) if is_target else _track_color(tid)
+        thickness = 3 if is_target else 2
         x1, y1, x2, y2 = (int(v) for v in t["bbox"])
 
         # Bounding box
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(out, f"ID:{tid}", (x1, y1 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
+        label = f"TARGET ID:{tid}" if is_target else f"ID:{tid}"
+        cv2.putText(out, label, (x1, y1 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, thickness)
 
         kps = t.get("keypoints")
         if kps is None:
@@ -67,7 +70,7 @@ def draw_results(
                 continue
             p1 = (int(kps[a, 0]), int(kps[a, 1]))
             p2 = (int(kps[b, 0]), int(kps[b, 1]))
-            cv2.line(out, p1, p2, color, 2)
+            cv2.line(out, p1, p2, color, thickness)
 
     return out
 

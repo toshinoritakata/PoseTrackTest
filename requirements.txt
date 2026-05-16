@@ -4,3 +4,5 @@ rtmlib>=0.0.13        # RTMPose with ONNX backend
 onnxruntime>=1.18     # ONNX inference (CPU / CoreML)
 opencv-python>=4.9
 numpy>=1.26
+yt-dlp>=2024.1        # YouTube URL support
+facenet-pytorch>=2.6  # Face detection (MTCNN) + recognition (InceptionResnetV1)
