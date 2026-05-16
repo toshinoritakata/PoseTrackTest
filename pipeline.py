@@ -432,10 +432,13 @@ class Pipeline:
             return
         if self._pending_frame is None or self._pending_results is None:
             return
+        fh, fw = self._pending_frame.shape[:2]
         for t in self._pending_results:
             x1, y1, x2, y2 = (int(v) for v in t["bbox"])
             if x1 <= x <= x2 and y1 <= y <= y2:
-                crop = self._pending_frame[y1:y2, x1:x2]
+                cx1 = max(0, x1); cy1 = max(0, y1)
+                cx2 = min(fw, x2); cy2 = min(fh, y2)
+                crop = self._pending_frame[cy1:cy2, cx1:cx2]
                 if self._face.register_from_crop(crop):
                     self._registering = False
                     self._target_id = t["track_id"]

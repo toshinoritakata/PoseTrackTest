@@ -50,8 +50,10 @@ class FaceIdentifier:
 
     def _embed(self, img_bgr: np.ndarray) -> np.ndarray | None:
         """BGR 画像から顔を検出し L2 正規化済み 512 次元埋め込みを返す。
-        顔が検出されない場合は None。
+        顔が検出されない場合や入力が空の場合は None。
         """
+        if img_bgr is None or img_bgr.size == 0:
+            return None
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         face = self._mtcnn(Image.fromarray(img_rgb))   # (3,160,160) or None
         if face is None:
@@ -107,13 +109,21 @@ class FaceIdentifier:
         if not self.registered or not tracks:
             return None
 
+        fh, fw = frame.shape[:2]
+
+        def _crop(t: dict) -> np.ndarray:
+            """bbox をフレーム内にクリップしてクロップを返す。"""
+            x1, y1, x2, y2 = (int(v) for v in t["bbox"])
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(fw, x2), min(fh, y2)
+            return frame[y1:y2, x1:x2]
+
         # 安定ターゲットの高速パス: 同じ track_id を先に確認
         if preferred_id is not None:
             for t in tracks:
                 if t["track_id"] != preferred_id:
                     continue
-                x1, y1, x2, y2 = (int(v) for v in t["bbox"])
-                emb = self._embed(frame[y1:y2, x1:x2])
+                emb = self._embed(_crop(t))
                 if emb is not None:
                     sim = float(np.dot(emb, self._target_emb))
                     if sim >= self._thresh:
@@ -126,8 +136,7 @@ class FaceIdentifier:
         for t in tracks:
             if t["track_id"] == preferred_id:
                 continue   # 上で既に検査済み
-            x1, y1, x2, y2 = (int(v) for v in t["bbox"])
-            emb = self._embed(frame[y1:y2, x1:x2])
+            emb = self._embed(_crop(t))
             if emb is None:
                 continue
             sim = float(np.dot(emb, self._target_emb))
