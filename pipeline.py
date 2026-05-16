@@ -44,7 +44,7 @@ class Config:
 
     # --- Pose ---
     pose_onnx: str | None = None     # None → _RTMPOSE_M_URL
-    pose_input_size: tuple = (192, 256)   # (W, H) for RTMPose-m
+    pose_input_size: tuple[int, int] = (192, 256)   # (W, H) for RTMPose-m
     pose_backend: str = "onnxruntime"
     pose_device: str = "mps"        # "mps" → CoreML EP（CPU比 2〜3×高速）
     pose_stride: int = 2            # RTMPose を N フレームに1回だけ実行
@@ -62,7 +62,7 @@ class Config:
     face_similarity_thresh: float = 0.6
     # ターゲット登録用の写真パス。None の場合は起動後にクリックで登録
     face_target_photo: str | None = None
-    # 顔認識をNフレームに1回実行（ターゲット確定後の定期確認）
+    # ターゲット未確定時は毎フレーム実行、確定後は N フレームに 1 回確認
     face_stride: int = 15
 
     # --- I/O ---
@@ -95,7 +95,12 @@ def _resolve_source(source: int | str) -> int | str:
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(source, download=False)
-        url = info.get("url") or info["requested_formats"][0]["url"]
+    url = info.get("url")
+    if not url:
+        formats = info.get("requested_formats") or []
+        url = formats[0].get("url") if formats else None
+    if not url:
+        raise RuntimeError(f"Could not extract playable stream URL from: {source}")
     return url
 
 
@@ -184,6 +189,14 @@ class Pipeline:
             model_input_size=self.cfg.pose_input_size,
             backend=self.cfg.pose_backend,
             device=self.cfg.pose_device,
+        )
+
+    def _reset_smoother(self, freq: float) -> None:
+        """スムーザーを指定周波数で再構築する（実 FPS 確定後に run() から呼ぶ）。"""
+        self._smoother = SmootherRegistry(
+            freq=freq,
+            min_cutoff=self.cfg.smooth_min_cutoff,
+            beta=self.cfg.smooth_beta,
         )
 
     # ------------------------------------------------------------------
@@ -406,7 +419,7 @@ class Pipeline:
         ]
 
         # 顔認識によるターゲット同定
-        if self._face is not None and self._face.registered and not self._registering:
+        if self._face is not None and not self._registering:
             run_face = (
                 self._target_id is None                                   # まだ未発見
                 or self._frame_idx % self.cfg.face_stride == 0            # 定期確認
@@ -432,13 +445,11 @@ class Pipeline:
             return
         if self._pending_frame is None or self._pending_results is None:
             return
-        fh, fw = self._pending_frame.shape[:2]
+        from face_identifier import clip_crop   # face_identifier は既にロード済み
         for t in self._pending_results:
             x1, y1, x2, y2 = (int(v) for v in t["bbox"])
             if x1 <= x <= x2 and y1 <= y <= y2:
-                cx1 = max(0, x1); cy1 = max(0, y1)
-                cx2 = min(fw, x2); cy2 = min(fh, y2)
-                crop = self._pending_frame[cy1:cy2, cx1:cx2]
+                crop = clip_crop(self._pending_frame, t["bbox"])
                 if self._face.register_from_crop(crop):
                     self._registering = False
                     self._target_id = t["track_id"]
@@ -464,13 +475,23 @@ class Pipeline:
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open source: {self.cfg.source}")
 
+        # 実際のフレームレートでスムーザーを再構築
+        actual_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self._reset_smoother(actual_fps)
+
         writer = None
         if self.cfg.output_path:
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(self.cfg.output_path, fourcc, fps, (w, h))
+            # avc1 (H.264) を優先、利用不可なら mp4v にフォールバック
+            for fourcc_str in ("avc1", "mp4v"):
+                fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+                writer = cv2.VideoWriter(self.cfg.output_path, fourcc, actual_fps, (w, h))
+                if writer.isOpened():
+                    break
+            else:
+                print(f"[Warning] Could not open video writer: {self.cfg.output_path}")
+                writer = None
 
         win = "Multi-person Tracking"
         if self.cfg.show:
@@ -479,6 +500,7 @@ class Pipeline:
                 cv2.setMouseCallback(win, self._on_mouse)
 
         t_prev = time.perf_counter()
+        fps_smooth: float = actual_fps   # EMA 初期値を公称 FPS で設定
         try:
             while True:
                 ret, frame = cap.read()
@@ -488,11 +510,12 @@ class Pipeline:
                 results = self.process_frame(frame)
 
                 t_now = time.perf_counter()
-                fps_live = 1.0 / max(t_now - t_prev, 1e-6)
+                fps_raw = 1.0 / max(t_now - t_prev, 1e-6)
                 t_prev = t_now
+                fps_smooth = 0.9 * fps_smooth + 0.1 * fps_raw  # EMA で平滑化
 
                 vis = draw_results(frame, results)
-                vis = draw_fps(vis, fps_live)
+                vis = draw_fps(vis, fps_smooth)
                 if self._face is not None:
                     vis = self._draw_face_overlay(vis)
 

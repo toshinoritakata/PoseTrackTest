@@ -13,6 +13,19 @@ import torch
 from PIL import Image
 
 
+def clip_crop(frame: np.ndarray, bbox) -> np.ndarray:
+    """bbox をフレーム内にクリップして crop を返す。
+
+    BoT-SORT の bbox はカルマンフィルタ予測によりフレーム境界をわずかに超えることがある。
+    cv2.cvtColor / MTCNN に渡す前にクリッピングして空配列になるのを防ぐ。
+    """
+    fh, fw = frame.shape[:2]
+    x1, y1, x2, y2 = (int(v) for v in bbox)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(fw, x2), min(fh, y2)
+    return frame[y1:y2, x1:x2]
+
+
 class FaceIdentifier:
     """ターゲット顔を登録し、トラック群の中から同一人物を識別する。"""
 
@@ -37,6 +50,10 @@ class FaceIdentifier:
             .eval()
             .to(self._device)
         )
+        # 初回推論ウォームアップ（登録クリック直後の遅延を防ぐ）
+        with torch.no_grad():
+            _dummy = torch.zeros(1, 3, 160, 160, device=self._device)
+            self._resnet(_dummy)
         self._target_emb: np.ndarray | None = None
         self._thresh = similarity_thresh
 
@@ -109,21 +126,12 @@ class FaceIdentifier:
         if not self.registered or not tracks:
             return None
 
-        fh, fw = frame.shape[:2]
-
-        def _crop(t: dict) -> np.ndarray:
-            """bbox をフレーム内にクリップしてクロップを返す。"""
-            x1, y1, x2, y2 = (int(v) for v in t["bbox"])
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(fw, x2), min(fh, y2)
-            return frame[y1:y2, x1:x2]
-
         # 安定ターゲットの高速パス: 同じ track_id を先に確認
         if preferred_id is not None:
             for t in tracks:
                 if t["track_id"] != preferred_id:
                     continue
-                emb = self._embed(_crop(t))
+                emb = self._embed(clip_crop(frame, t["bbox"]))
                 if emb is not None:
                     sim = float(np.dot(emb, self._target_emb))
                     if sim >= self._thresh:
@@ -136,7 +144,7 @@ class FaceIdentifier:
         for t in tracks:
             if t["track_id"] == preferred_id:
                 continue   # 上で既に検査済み
-            emb = self._embed(_crop(t))
+            emb = self._embed(clip_crop(frame, t["bbox"]))
             if emb is None:
                 continue
             sim = float(np.dot(emb, self._target_emb))

@@ -33,7 +33,7 @@ def parse_args() -> Config:
         show=not args.no_show,
         output_path=args.output,
         smooth_beta=args.smooth_beta,
-        face_enabled=args.face,
+        face_enabled=args.face or bool(args.target_photo),
         face_target_photo=args.target_photo,
         face_similarity_thresh=args.face_thresh,
     )
