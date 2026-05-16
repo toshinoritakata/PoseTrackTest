@@ -41,6 +41,9 @@ class Config:
     reid_stability_thresh: int = 5
     # 安定トラックの前回 bbox との IoU がこれ以上なら embedding を再利用
     reid_stable_iou_thresh: float = 0.5
+    # 1フレームあたりの新規 ReID 推論数の上限（超過分は次フレームに持ち越し）
+    # 混雑シーンや初期フレームでの急激な速度低下を防ぐ
+    reid_max_fresh: int = 4
 
     # --- Pose ---
     pose_onnx: str | None = None     # None → _RTMPOSE_M_URL
@@ -203,8 +206,13 @@ class Pipeline:
                 if best_val[i] >= self.cfg.reid_stable_iou_thresh:
                     reuse[i] = stable[stable_tids[best_idx[i]]][1]
 
-        # 再利用できない検出のみ新規推論
-        fresh_idx = [i for i in range(n) if i not in reuse]
+        # 新規推論が必要な検出を信頼度降順に並べ、上限まで推論
+        # 超過分はゼロベクトルで埋め次フレームに持ち越す（ID switch より速度優先）
+        fresh_all = [i for i in range(n) if i not in reuse]
+        if self.cfg.reid_max_fresh > 0:
+            fresh_all.sort(key=lambda i: -dets[i, 4])   # conf 降順
+        fresh_idx = fresh_all[: self.cfg.reid_max_fresh]
+
         fresh_embs = (
             self._reid.model.get_features(bboxes[fresh_idx], frame)
             if fresh_idx else np.empty((0, 1), dtype=np.float32)
@@ -212,7 +220,8 @@ class Pipeline:
 
         emb_dim = (
             fresh_embs.shape[1] if fresh_idx
-            else next(iter(reuse.values())).shape[0]
+            else next(iter(reuse.values())).shape[0] if reuse
+            else 512  # OSNet デフォルト次元
         )
         embs = np.zeros((n, emb_dim), dtype=np.float32)
         for j, i in enumerate(fresh_idx):
