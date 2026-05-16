@@ -37,6 +37,10 @@ class Config:
     # 精度重視: osnet_x1_0_msmt17.pt、軽量: osnet_x0_25_msmt17.pt
     reid_model: str = "osnet_x1_0_msmt17.pt"
     reid_device: str = "mps"
+    # N フレーム連続マッチしたトラックを「安定」と判定し ReID をスキップ
+    reid_stability_thresh: int = 5
+    # 安定トラックの前回 bbox との IoU がこれ以上なら embedding を再利用
+    reid_stable_iou_thresh: float = 0.5
 
     # --- Pose ---
     pose_onnx: str | None = None     # None → _RTMPOSE_M_URL
@@ -84,11 +88,26 @@ def _resolve_source(source: int | str) -> int | str:
     return url
 
 
+def _bbox_iou(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Vectorized IoU between (N,4) and (M,4) xyxy arrays. Returns (N,M)."""
+    inter_x1 = np.maximum(a[:, None, 0], b[None, :, 0])
+    inter_y1 = np.maximum(a[:, None, 1], b[None, :, 1])
+    inter_x2 = np.minimum(a[:, None, 2], b[None, :, 2])
+    inter_y2 = np.minimum(a[:, None, 3], b[None, :, 3])
+    inter = (np.maximum(inter_x2 - inter_x1, 0)
+             * np.maximum(inter_y2 - inter_y1, 0))
+    area_a = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+    area_b = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    union = area_a[:, None] + area_b[None, :] - inter
+    return inter / np.maximum(union, 1e-6)
+
+
 class Pipeline:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self._reid = None                              # populated by _build_tracker
         self._detector = self._build_detector()
-        self._tracker = self._build_tracker()
+        self._tracker = self._build_tracker()          # may set self._reid
         self._pose = self._build_pose()
         self._smoother = SmootherRegistry(
             freq=cfg.smooth_freq,
@@ -97,6 +116,10 @@ class Pipeline:
         )
         self._frame_idx: int = 0
         self._pose_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        # ReID 安定スキップ用ステート
+        self._track_hits: dict[int, int] = {}          # track_id → 連続マッチ回数
+        self._emb_cache: dict[int, np.ndarray] = {}   # track_id → 最後の embedding
+        self._bbox_cache: dict[int, np.ndarray] = {}  # track_id → 最後の bbox
 
     # ------------------------------------------------------------------
     # Component construction
@@ -112,8 +135,8 @@ class Pipeline:
         if self.cfg.tracker_with_reid:
             from boxmot.reid.core.reid import ReID
             from boxmot.utils import WEIGHTS
-            reid = ReID(path=WEIGHTS / self.cfg.reid_model, device=self.cfg.reid_device)
-            reid_model = reid.model
+            self._reid = ReID(path=WEIGHTS / self.cfg.reid_model, device=self.cfg.reid_device)
+            reid_model = self._reid.model
         return BotSort(reid_model=reid_model, with_reid=self.cfg.tracker_with_reid)
 
     def _build_pose(self):
@@ -145,16 +168,108 @@ class Pipeline:
             return np.empty((0, 6), dtype=np.float32)
         return boxes.data.cpu().numpy().astype(np.float32)
 
+    def _compute_embeddings_selective(
+        self, dets: np.ndarray, frame: np.ndarray
+    ) -> np.ndarray:
+        """安定トラックにマッチする検出は embedding キャッシュを再利用。
+
+        安定トラック（hits >= reid_stability_thresh）の前回 bbox と IoU を比較し、
+        閾値以上なら新規推論をスキップする。新規/不安定な検出のみ get_features() を呼ぶ。
+
+        Returns:
+            embs: (N, D) float32
+        """
+        n = len(dets)
+        bboxes = dets[:, :4]
+
+        # 安定トラック: hits が閾値以上かつキャッシュあり
+        stable = {
+            tid: (self._bbox_cache[tid], self._emb_cache[tid])
+            for tid, hits in self._track_hits.items()
+            if hits >= self.cfg.reid_stability_thresh
+            and tid in self._bbox_cache
+            and tid in self._emb_cache
+        }
+
+        # IoU マッチングで各検出を安定トラックに対応付け
+        reuse: dict[int, np.ndarray] = {}   # det_idx → reuse embedding
+        if stable:
+            stable_tids = list(stable)
+            stable_bboxes = np.array([stable[tid][0] for tid in stable_tids])
+            iou = _bbox_iou(bboxes, stable_bboxes)   # (N, S)
+            best_val = iou.max(axis=1)
+            best_idx = iou.argmax(axis=1)
+            for i in range(n):
+                if best_val[i] >= self.cfg.reid_stable_iou_thresh:
+                    reuse[i] = stable[stable_tids[best_idx[i]]][1]
+
+        # 再利用できない検出のみ新規推論
+        fresh_idx = [i for i in range(n) if i not in reuse]
+        fresh_embs = (
+            self._reid.model.get_features(bboxes[fresh_idx], frame)
+            if fresh_idx else np.empty((0, 1), dtype=np.float32)
+        )
+
+        emb_dim = (
+            fresh_embs.shape[1] if fresh_idx
+            else next(iter(reuse.values())).shape[0]
+        )
+        embs = np.zeros((n, emb_dim), dtype=np.float32)
+        for j, i in enumerate(fresh_idx):
+            embs[i] = fresh_embs[j]
+        for i, emb in reuse.items():
+            embs[i] = emb
+        return embs
+
     def _track(self, dets: np.ndarray, frame: np.ndarray) -> np.ndarray:
         """Return tracks array of shape (M, 8): [x1,y1,x2,y2,track_id,conf,cls,det_ind].
 
         検出なしでも update() を呼ぶことで Kalman フィルタが内部状態を更新し、
         消えたトラックを正しくエージアウトできる。
         """
-        tracks = self._tracker.update(dets, frame)
-        if tracks is None or len(tracks) == 0:
-            return np.empty((0, 8), dtype=np.float32)
-        return np.asarray(tracks, dtype=np.float32)
+        embs = None
+        if self._reid is not None and len(dets) > 0:
+            embs = self._compute_embeddings_selective(dets, frame)
+
+        tracks = self._tracker.update(dets, frame, embs)
+        result = (
+            np.asarray(tracks, dtype=np.float32)
+            if tracks is not None and len(tracks) > 0
+            else np.empty((0, 8), dtype=np.float32)
+        )
+        self._update_reid_state(result, dets, embs)
+        return result
+
+    def _update_reid_state(
+        self,
+        tracks: np.ndarray,
+        dets: np.ndarray,
+        embs: np.ndarray | None,
+    ) -> None:
+        """安定度カウンタ・embedding・bbox キャッシュを更新。"""
+        active_ids = set(tracks[:, 4].astype(int)) if len(tracks) > 0 else set()
+
+        # 安定度カウンタ更新（登場: +1 / 消滅: 削除）
+        for tid in active_ids:
+            self._track_hits[tid] = self._track_hits.get(tid, 0) + 1
+        for tid in set(self._track_hits) - active_ids:
+            del self._track_hits[tid]
+            self._emb_cache.pop(tid, None)
+            self._bbox_cache.pop(tid, None)
+
+        if len(tracks) == 0 or embs is None:
+            return
+
+        # bbox・embedding キャッシュ更新
+        # track bbox と det bbox の IoU で対応する embedding を特定
+        det_bboxes = dets[:, :4]
+        for track in tracks:
+            tid = int(track[4])
+            self._bbox_cache[tid] = track[:4].copy()
+            iou = _bbox_iou(track[:4][None, :], det_bboxes)[0]  # (N,)
+            best = int(iou.argmax())
+            if iou[best] >= 0.3:
+                self._emb_cache[tid] = embs[best].copy()
 
     def _estimate_pose(
         self,
