@@ -41,9 +41,6 @@ class Config:
     reid_stability_thresh: int = 5
     # 安定トラックの前回 bbox との IoU がこれ以上なら embedding を再利用
     reid_stable_iou_thresh: float = 0.5
-    # 1フレームあたりの新規 ReID 推論数の上限（超過分は次フレームに持ち越し）
-    # 混雑シーンや初期フレームでの急激な速度低下を防ぐ
-    reid_max_fresh: int = 4
 
     # --- Pose ---
     pose_onnx: str | None = None     # None → _RTMPOSE_M_URL
@@ -164,6 +161,7 @@ class Pipeline:
     def _build_face(self):
         if not self.cfg.face_enabled:
             return None
+        print("[FaceID] Loading MTCNN + InceptionResnetV1 (VGGFace2) …")
         from face_identifier import FaceIdentifier
         fi = FaceIdentifier(
             similarity_thresh=self.cfg.face_similarity_thresh,
@@ -175,6 +173,8 @@ class Pipeline:
                     f"No face detected in photo: {self.cfg.face_target_photo}"
                 )
             print(f"[FaceID] Target registered from photo: {self.cfg.face_target_photo}")
+        else:
+            print("[FaceID] Ready — click on a person in the video window to register target")
         return fi
 
     def _build_pose(self):
@@ -214,6 +214,10 @@ class Pipeline:
         安定トラック（hits >= reid_stability_thresh）の前回 bbox と IoU を比較し、
         閾値以上なら新規推論をスキップする。新規/不安定な検出のみ get_features() を呼ぶ。
 
+        ゼロベクトル埋めは BoT-SORT の外観マッチングを壊すため使わない。
+        キャッシュにマッチしない検出はすべて新規推論する（安定スキップで
+        大半の検出は再利用されるため実際の推論数は限定的）。
+
         Returns:
             embs: (N, D) float32
         """
@@ -241,12 +245,9 @@ class Pipeline:
                 if best_val[i] >= self.cfg.reid_stable_iou_thresh:
                     reuse[i] = stable[stable_tids[best_idx[i]]][1]
 
-        # 新規推論が必要な検出を信頼度降順に並べ、上限まで推論
-        # 超過分はゼロベクトルで埋め次フレームに持ち越す（ID switch より速度優先）
-        fresh_all = [i for i in range(n) if i not in reuse]
-        if self.cfg.reid_max_fresh > 0:
-            fresh_all.sort(key=lambda i: -dets[i, 4])   # conf 降順
-        fresh_idx = fresh_all[: self.cfg.reid_max_fresh]
+        # キャッシュ再利用できない検出をすべて新規推論する
+        # ゼロベクトルでの代替は ID switch の原因になるため行わない
+        fresh_idx = [i for i in range(n) if i not in reuse]
 
         fresh_embs = (
             self._reid.model.get_features(bboxes[fresh_idx], frame)
