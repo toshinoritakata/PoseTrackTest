@@ -15,11 +15,11 @@ import numpy as np
 from smoother import SmootherRegistry
 from visualizer import draw_results, draw_fps
 
-# RTMPose-m ONNX weights (auto-downloaded by rtmlib on first run)
 _RTMPOSE_M_URL = (
     "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/"
     "rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip"
 )
+_N_KEYPOINTS = 17
 
 
 @dataclass
@@ -34,35 +34,40 @@ class Config:
     # --- Tracking ---
     tracker_with_reid: bool = True
     # ReID モデル名またはローカル .pt/.onnx パス
-    # boxmot デフォルト: osnet_x0_25_msmt17.pt（軽量・高速）
-    # 精度重視: osnet_x1_0_msmt17.pt
+    # 精度重視: osnet_x1_0_msmt17.pt、軽量: osnet_x0_25_msmt17.pt
     reid_model: str = "osnet_x1_0_msmt17.pt"
     reid_device: str = "mps"
 
     # --- Pose ---
-    # rtmlib RTMPose に渡す ONNX モデル URL またはローカルパス
-    pose_onnx: str = _RTMPOSE_M_URL
+    pose_onnx: str | None = None     # None → _RTMPOSE_M_URL
     pose_input_size: tuple = (192, 256)   # (W, H) for RTMPose-m
     pose_backend: str = "onnxruntime"
     pose_device: str = "mps"        # "mps" → CoreML EP（CPU比 2〜3×高速）
-    pose_conf: float = 0.3
     pose_stride: int = 2            # RTMPose を N フレームに1回だけ実行
 
     # --- Smoothing ---
-    smooth_freq: float = 30.0    # expected FPS
+    smooth_freq: float = 30.0
     smooth_min_cutoff: float = 1.0
-    smooth_beta: float = 0.01    # 大きくするほど速い動きへの追従が向上
+    smooth_beta: float = 0.01       # 大きくするほど速い動きへの追従が向上
 
     # --- I/O ---
-    source: int | str = 0        # 0 = webcam、または動画ファイルパス
+    source: int | str = 0
     show: bool = True
-    output_path: str | None = None  # 書き出す場合にパスを指定
+    output_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.pose_onnx is None:
+            self.pose_onnx = _RTMPOSE_M_URL
 
 
 def _resolve_source(source: int | str) -> int | str:
-    """Return a YouTube direct-stream URL if source looks like a YouTube link."""
+    """Coerce string camera index to int; resolve YouTube URL to direct stream."""
     if not isinstance(source, str):
         return source
+    try:
+        return int(source)
+    except ValueError:
+        pass
     if "youtube.com" not in source and "youtu.be" not in source:
         return source
 
@@ -91,7 +96,6 @@ class Pipeline:
             beta=cfg.smooth_beta,
         )
         self._frame_idx: int = 0
-        # track_id → last keypoints (17,2), scores (17)  for stride carry-forward
         self._pose_cache: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
     # ------------------------------------------------------------------
@@ -100,8 +104,7 @@ class Pipeline:
 
     def _build_detector(self):
         from ultralytics import YOLO
-        model = YOLO(self.cfg.yolo_weights)
-        return model
+        return YOLO(self.cfg.yolo_weights)
 
     def _build_tracker(self):
         from boxmot.trackers.botsort.botsort import BotSort
@@ -109,23 +112,18 @@ class Pipeline:
         if self.cfg.tracker_with_reid:
             from boxmot.reid.core.reid import ReID
             from boxmot.utils import WEIGHTS
-            model_path = WEIGHTS / self.cfg.reid_model
-            reid = ReID(path=model_path, device=self.cfg.reid_device)
+            reid = ReID(path=WEIGHTS / self.cfg.reid_model, device=self.cfg.reid_device)
             reid_model = reid.model
-        tracker = BotSort(reid_model=reid_model, with_reid=self.cfg.tracker_with_reid)
-        return tracker
+        return BotSort(reid_model=reid_model, with_reid=self.cfg.tracker_with_reid)
 
     def _build_pose(self):
         from rtmlib import RTMPose
-        # onnx_model には URL またはローカル .onnx パスを渡す
-        # rtmlib が初回起動時に自動ダウンロード・キャッシュする
-        pose = RTMPose(
+        return RTMPose(
             self.cfg.pose_onnx,
             model_input_size=self.cfg.pose_input_size,
             backend=self.cfg.pose_backend,
             device=self.cfg.pose_device,
         )
-        return pose
 
     # ------------------------------------------------------------------
     # Per-frame processing
@@ -135,7 +133,7 @@ class Pipeline:
         """Return detections as float32 array of shape (N, 6): [x1,y1,x2,y2,conf,cls]."""
         results = self._detector.predict(
             frame,
-            classes=[0],            # person only
+            classes=[0],
             conf=self.cfg.yolo_conf,
             iou=self.cfg.yolo_iou,
             imgsz=self.cfg.yolo_imgsz,
@@ -145,14 +143,10 @@ class Pipeline:
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
             return np.empty((0, 6), dtype=np.float32)
-
-        xyxy = boxes.xyxy.cpu().numpy()          # (N, 4)
-        conf = boxes.conf.cpu().numpy()[:, None]  # (N, 1)
-        cls  = boxes.cls.cpu().numpy()[:, None]   # (N, 1)
-        return np.concatenate([xyxy, conf, cls], axis=1).astype(np.float32)
+        return boxes.data.cpu().numpy().astype(np.float32)
 
     def _track(self, dets: np.ndarray, frame: np.ndarray) -> np.ndarray:
-        """Return TrackResults array of shape (M, 8): [x1,y1,x2,y2,track_id,conf,cls,det_ind].
+        """Return tracks array of shape (M, 8): [x1,y1,x2,y2,track_id,conf,cls,det_ind].
 
         検出なしでも update() を呼ぶことで Kalman フィルタが内部状態を更新し、
         消えたトラックを正しくエージアウトできる。
@@ -167,6 +161,7 @@ class Pipeline:
         frame: np.ndarray,
         bboxes: np.ndarray,
         track_ids: list[int],
+        active_ids: set[int],
     ) -> tuple[np.ndarray, np.ndarray]:
         """Run RTMPose on tracked bboxes with stride-based skipping.
 
@@ -175,34 +170,22 @@ class Pipeline:
         視覚的な劣化はほぼ出ない。
 
         Returns:
-            keypoints : (M, 17, 2)
-            scores    : (M, 17)
+            keypoints : (M, _N_KEYPOINTS, 2)
+            scores    : (M, _N_KEYPOINTS)
         """
-        if len(bboxes) == 0:
-            self._pose_cache.clear()
-            return np.empty((0, 17, 2)), np.empty((0, 17))
-
-        run_pose = (self._frame_idx % self.cfg.pose_stride == 0)
-
-        if run_pose:
+        if self._frame_idx % self.cfg.pose_stride == 0:
             keypoints, scores = self._pose(frame, bboxes=bboxes.tolist())
-            # キャッシュ更新
             for i, tid in enumerate(track_ids):
                 self._pose_cache[tid] = (keypoints[i].copy(), scores[i].copy())
         else:
-            # キャッシュから復元。初登場の track_id はゼロ埋め
-            n_kp = 17
-            keypoints = np.zeros((len(track_ids), n_kp, 2), dtype=np.float32)
-            scores    = np.zeros((len(track_ids), n_kp),    dtype=np.float32)
+            keypoints = np.zeros((len(track_ids), _N_KEYPOINTS, 2), dtype=np.float32)
+            scores    = np.zeros((len(track_ids), _N_KEYPOINTS),    dtype=np.float32)
             for i, tid in enumerate(track_ids):
                 if tid in self._pose_cache:
                     keypoints[i], scores[i] = self._pose_cache[tid]
 
-        # 消えた track_id をキャッシュから削除
-        active = set(track_ids)
-        for tid in list(self._pose_cache):
-            if tid not in active:
-                del self._pose_cache[tid]
+        for tid in set(self._pose_cache) - active_ids:
+            del self._pose_cache[tid]
 
         return keypoints, scores
 
@@ -212,15 +195,11 @@ class Pipeline:
         keypoints: np.ndarray,
         scores: np.ndarray,
     ) -> np.ndarray:
-        """Apply per-track One-Euro smoothing and return (M, 17, 3) kps+conf."""
-        kps_with_conf = np.concatenate(
-            [keypoints, scores[:, :, None]], axis=-1
-        )  # (M, 17, 3)
+        """Apply per-track One-Euro smoothing and return (M, _N_KEYPOINTS, 3) kps+conf."""
+        kps_with_conf = np.concatenate([keypoints, scores[:, :, None]], axis=-1)
         smoothed = np.empty_like(kps_with_conf)
-        active_ids = set(track_ids)
         for i, tid in enumerate(track_ids):
             smoothed[i] = self._smoother.update(tid, kps_with_conf[i])
-        self._smoother.cleanup(active_ids)
         return smoothed
 
     def process_frame(self, frame: np.ndarray) -> list[dict]:
@@ -231,30 +210,31 @@ class Pipeline:
             {
                 "track_id"  : int,
                 "bbox"      : (x1, y1, x2, y2),
-                "keypoints" : np.ndarray (17, 3),  # x, y, conf
+                "keypoints" : np.ndarray (_N_KEYPOINTS, 3),  # x, y, conf
             }
         """
+        self._frame_idx += 1
+
         dets   = self._detect(frame)
         tracks = self._track(dets, frame)
 
         if len(tracks) == 0:
+            self._pose_cache.clear()
+            self._smoother.cleanup(set())
             return []
 
-        track_ids = tracks[:, 4].astype(int).tolist()
-        bboxes    = tracks[:, :4]
+        track_ids  = tracks[:, 4].astype(int).tolist()
+        bboxes     = tracks[:, :4]
+        active_ids = set(track_ids)
 
-        keypoints, scores = self._estimate_pose(frame, bboxes, track_ids)
+        keypoints, scores = self._estimate_pose(frame, bboxes, track_ids, active_ids)
         smoothed = self._smooth(track_ids, keypoints, scores)
-        self._frame_idx += 1
+        self._smoother.cleanup(active_ids)
 
-        results = []
-        for i, tid in enumerate(track_ids):
-            results.append({
-                "track_id":  tid,
-                "bbox":      bboxes[i],
-                "keypoints": smoothed[i],   # (17, 3)
-            })
-        return results
+        return [
+            {"track_id": tid, "bbox": bboxes[i], "keypoints": smoothed[i]}
+            for i, tid in enumerate(track_ids)
+        ]
 
     # ------------------------------------------------------------------
     # Main loop

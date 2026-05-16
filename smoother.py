@@ -66,7 +66,7 @@ class KeypointSmoother:
         Returns:
             Smoothed keypoints, same shape as input.
         """
-        out = keypoints.copy().astype(float)
+        out = keypoints.astype(np.float64, copy=True)
         for i, (fx, fy) in enumerate(self._filters):
             out[i, 0] = fx(keypoints[i, 0])
             out[i, 1] = fy(keypoints[i, 1])
